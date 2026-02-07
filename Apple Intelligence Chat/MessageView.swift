@@ -69,16 +69,143 @@ struct MarkdownText: View {
                 case .code:
                     CodeBlockView(code: block.content, language: block.language)
                 case .text:
-                    if let attributedString = try? AttributedString(markdown: block.content, options: AttributedString.MarkdownParsingOptions(interpretedSyntax: .inlineOnlyPreservingWhitespace)) {
-                        Text(attributedString)
-                            .textSelection(.enabled)
-                    } else {
-                        Text(block.content)
-                            .textSelection(.enabled)
-                    }
+                    renderTextBlock(block.content)
                 }
             }
         }
+    }
+    
+    /// Renders a text block by splitting it into paragraphs so that
+    /// headings, list items, and line breaks are preserved.
+    @ViewBuilder
+    private func renderTextBlock(_ content: String) -> some View {
+        let paragraphs = splitIntoParagraphs(content)
+        ForEach(paragraphs, id: \.id) { paragraph in
+            if let attributedString = try? AttributedString(
+                markdown: paragraph.content,
+                options: AttributedString.MarkdownParsingOptions(
+                    interpretedSyntax: .inlineOnlyPreservingWhitespace
+                )
+            ) {
+                // Apply heading styling based on prefix
+                if paragraph.headingLevel > 0 {
+                    Text(attributedString)
+                        .font(fontForHeadingLevel(paragraph.headingLevel))
+                        .fontWeight(.bold)
+                        .textSelection(.enabled)
+                } else {
+                    Text(attributedString)
+                        .textSelection(.enabled)
+                }
+            } else {
+                Text(paragraph.content)
+                    .textSelection(.enabled)
+            }
+        }
+    }
+    
+    /// Splits a text block into separate paragraphs, preserving blank-line
+    /// separation and keeping headings, list items, etc. on their own lines.
+    private func splitIntoParagraphs(_ text: String) -> [TextParagraph] {
+        let lines = text.components(separatedBy: "\n")
+        var paragraphs: [TextParagraph] = []
+        var currentLines: [String] = []
+        
+        for (index, line) in lines.enumerated() {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            let isHeading = trimmed.hasPrefix("#")
+            let isListItem = trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ")
+                || trimmed.first.map({ $0.isNumber && trimmed.contains(". ") }) == true
+            let isEmpty = trimmed.isEmpty
+            
+            // Check if the next line is a heading or list item
+            let nextLine = index + 1 < lines.count ? lines[index + 1].trimmingCharacters(in: .whitespaces) : ""
+            let nextIsHeading = nextLine.hasPrefix("#")
+            let nextIsListItem = nextLine.hasPrefix("- ") || nextLine.hasPrefix("* ")
+                || nextLine.first.map({ $0.isNumber && nextLine.contains(". ") }) == true
+            
+            if isHeading {
+                // Flush any accumulated text before the heading
+                if !currentLines.isEmpty {
+                    let joined = currentLines.joined(separator: "\n")
+                    if !joined.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        paragraphs.append(TextParagraph(content: joined, headingLevel: 0))
+                    }
+                    currentLines = []
+                }
+                // Parse heading level and content
+                let (level, headingContent) = parseHeading(trimmed)
+                paragraphs.append(TextParagraph(content: headingContent, headingLevel: level))
+            } else if isEmpty {
+                // Blank line: flush accumulated text as a paragraph
+                if !currentLines.isEmpty {
+                    let joined = currentLines.joined(separator: "\n")
+                    if !joined.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        paragraphs.append(TextParagraph(content: joined, headingLevel: 0))
+                    }
+                    currentLines = []
+                }
+            } else if isListItem && !currentLines.isEmpty && !isListLine(currentLines.last ?? "") {
+                // Starting a list after non-list text: flush first
+                let joined = currentLines.joined(separator: "\n")
+                if !joined.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    paragraphs.append(TextParagraph(content: joined, headingLevel: 0))
+                }
+                currentLines = [line]
+            } else {
+                currentLines.append(line)
+                // If next line is a heading or we're at end, flush
+                if nextIsHeading {
+                    let joined = currentLines.joined(separator: "\n")
+                    if !joined.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                        paragraphs.append(TextParagraph(content: joined, headingLevel: 0))
+                    }
+                    currentLines = []
+                }
+            }
+        }
+        
+        // Flush remaining lines
+        if !currentLines.isEmpty {
+            let joined = currentLines.joined(separator: "\n")
+            if !joined.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                paragraphs.append(TextParagraph(content: joined, headingLevel: 0))
+            }
+        }
+        
+        return paragraphs
+    }
+    
+    /// Parses a heading line like "## Hello" into (level: 2, content: "Hello")
+    private func parseHeading(_ line: String) -> (Int, String) {
+        var level = 0
+        var index = line.startIndex
+        while index < line.endIndex && line[index] == "#" {
+            level += 1
+            index = line.index(after: index)
+        }
+        let content = String(line[index...]).trimmingCharacters(in: .whitespaces)
+        return (min(level, 6), content)
+    }
+    
+    /// Returns the appropriate font for a heading level (1–6)
+    private func fontForHeadingLevel(_ level: Int) -> Font {
+        switch level {
+        case 1: return .title
+        case 2: return .title2
+        case 3: return .title3
+        case 4: return .headline
+        case 5: return .subheadline
+        default: return .subheadline
+        }
+    }
+    
+    /// Returns true if a line looks like a list item (-, *, or numbered)
+    private func isListLine(_ line: String) -> Bool {
+        let trimmed = line.trimmingCharacters(in: .whitespaces)
+        if trimmed.hasPrefix("- ") || trimmed.hasPrefix("* ") { return true }
+        if let first = trimmed.first, first.isNumber, trimmed.contains(". ") { return true }
+        return false
     }
     
     // Parse markdown into code blocks and text blocks
@@ -180,6 +307,13 @@ struct MarkdownBlock: Identifiable {
         self.content = content
         self.language = language
     }
+}
+
+/// Represents a paragraph of text with optional heading level
+struct TextParagraph: Identifiable {
+    let id = UUID()
+    let content: String
+    let headingLevel: Int
 }
 
 /// View for displaying a code block with styling
