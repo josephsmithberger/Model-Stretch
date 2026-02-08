@@ -29,44 +29,27 @@ struct ContentView: View {
     @AppStorage("useStreaming") private var useStreaming = AppSettings.useStreaming
     @AppStorage("temperature") private var temperature = AppSettings.temperature
     @AppStorage("systemInstructions") private var systemInstructions = AppSettings.systemInstructions
+    @AppStorage("agentModeEnabled") private var agentModeEnabled = AppSettings.agentModeEnabled
     
     // Haptics
 #if os(iOS)
     private let hapticStreamGenerator = UISelectionFeedbackGenerator()
 #endif
     
+    // Agent mode key for resetting
+    @State private var agentViewID = UUID()
+
     var body: some View {
         NavigationStack {
-            ZStack {
-                // Chat Messages ScrollView
-                ScrollViewReader { proxy in
-                    ScrollView {
-                        VStack {
-                            ForEach(messages) { message in
-                                MessageView(message: message, isResponding: isResponding)
-                                    .id(message.id)
-                            }
-                        }
-                        .padding()
-                        .padding(.bottom, 90) // Space for floating input field
-                    }
-                    .onChange(of: messages.last?.text) {
-                        if let lastMessage = messages.last {
-                            withAnimation {
-                                proxy.scrollTo(lastMessage.id, anchor: .bottom)
-                            }
-                        }
-                    }
-                }
-                
-                // Floating Input Field
-                VStack {
-                    Spacer()
-                    inputField
-                        .padding(20)
+            Group {
+                if agentModeEnabled {
+                    AgentRelayView()
+                        .id(agentViewID)
+                } else {
+                    normalChatView
                 }
             }
-            .navigationTitle("Apple Intelligence Chat")
+            .navigationTitle(agentModeEnabled ? "Agent Relay ⚡" : "Apple Intelligence Chat")
 #if os(iOS)
             .navigationBarTitleDisplayMode(.inline)
 #endif
@@ -80,6 +63,40 @@ struct ContentView: View {
                 Button("OK") {}
             } message: {
                 Text(errorMessage)
+            }
+        }
+    }
+    
+    // MARK: - Normal Chat View
+    
+    private var normalChatView: some View {
+        ZStack {
+            // Chat Messages ScrollView
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack {
+                        ForEach(messages) { message in
+                            MessageView(message: message, isResponding: isResponding)
+                                .id(message.id)
+                        }
+                    }
+                    .padding()
+                    .padding(.bottom, 90) // Space for floating input field
+                }
+                .onChange(of: messages.last?.text) {
+                    if let lastMessage = messages.last {
+                        withAnimation {
+                            proxy.scrollTo(lastMessage.id, anchor: .bottom)
+                        }
+                    }
+                }
+            }
+            
+            // Floating Input Field
+            VStack {
+                Spacer()
+                inputField
+                    .padding(20)
             }
         }
     }
@@ -227,6 +244,8 @@ struct ContentView: View {
         stopStreaming()
         messages.removeAll()
         session = nil
+        // Reset agent relay by changing its identity
+        agentViewID = UUID()
     }
     
     private func availabilityDescription(for availability: SystemLanguageModel.Availability) -> String {
