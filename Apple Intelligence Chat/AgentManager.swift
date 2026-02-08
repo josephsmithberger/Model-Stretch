@@ -211,6 +211,12 @@ class AgentManager {
             for (agentIdx, agent) in agents.enumerated() {
                 guard !Task.isCancelled else { break }
 
+                // Brief pause between agents to avoid overwhelming the
+                // on-device model service (prevents ViewBridge disconnects)
+                if agentIdx > 0 {
+                    try? await Task.sleep(for: .milliseconds(500))
+                }
+
                 currentAgentIndex = agentIdx
 
                 // ── Run the agent with a fresh session ──
@@ -276,9 +282,14 @@ class AgentManager {
                     previousOutput = revOutput
                     previousAgentName = targetConfig.name
                 } else {
-                    // Normal handoff
-                    previousOutput = output
-                    previousAgentName = agent.name
+                    // Normal handoff — only update context if the agent
+                    // produced a real response (not an error fallback)
+                    if !output.hasPrefix("⚠️") {
+                        previousOutput = output
+                        previousAgentName = agent.name
+                    }
+                    // If the agent errored, keep the previous valid output
+                    // so the next agent still gets usable context
                 }
             }
 
@@ -310,6 +321,10 @@ class AgentManager {
     ///
     /// Every call to this method creates a new session — no session is ever
     /// reused. This is the core "no context rot" guarantee.
+    ///
+    /// Includes retry logic: if the session crashes (e.g. ViewBridge disconnect)
+    /// or returns an empty response, the agent retries up to `maxRetries` times
+    /// with a fresh session each attempt.
     private func runAgent(
         agent: AgentConfig,
         userMessage: String,
@@ -318,40 +333,81 @@ class AgentManager {
         temperature: Double,
         useStreaming: Bool,
         turnIndex: Int,
-        messageIndex: Int
+        messageIndex: Int,
+        maxRetries: Int = 2
     ) async -> String {
-        let tools = buildTools()
-        let session = LanguageModelSession(
-            tools: tools,
-            instructions: agent.systemPrompt
-        )
-        let options = GenerationOptions(temperature: temperature)
+        var lastError: Error?
 
-        let prompt = buildFocusedPrompt(
-            previousAgentName: previousAgentName,
-            previousOutput: previousOutput,
-            userMessage: userMessage
-        )
+        for attempt in 0...maxRetries {
+            guard !Task.isCancelled else { break }
 
-        do {
-            if useStreaming {
-                let stream = session.streamResponse(to: prompt, options: options)
-                for try await partial in stream {
-                    guard !Task.isCancelled else { break }
-                    relayTurns[turnIndex].agentMessages[messageIndex].text = partial.content
-                }
-            } else {
-                let response = try await session.respond(to: prompt, options: options)
-                relayTurns[turnIndex].agentMessages[messageIndex].text = response.content
+            // Pause before retries to let the on-device model service recover
+            if attempt > 0 {
+                relayTurns[turnIndex].agentMessages[messageIndex].text = ""
+                try? await Task.sleep(for: .seconds(1))
             }
-        } catch is CancellationError {
-            // Cancelled — leave text as-is
-        } catch {
-            relayTurns[turnIndex].agentMessages[messageIndex].text = "⚠️ Error: \(error.localizedDescription)"
+
+            // Fresh session every attempt — never reuse
+            let tools = buildTools()
+            let session = LanguageModelSession(
+                tools: tools,
+                instructions: agent.systemPrompt
+            )
+            let options = GenerationOptions(temperature: temperature)
+
+            let prompt = buildFocusedPrompt(
+                previousAgentName: previousAgentName,
+                previousOutput: previousOutput,
+                userMessage: userMessage
+            )
+
+            do {
+                if useStreaming {
+                    let stream = session.streamResponse(to: prompt, options: options)
+                    for try await partial in stream {
+                        guard !Task.isCancelled else { break }
+                        relayTurns[turnIndex].agentMessages[messageIndex].text = partial.content
+                    }
+                } else {
+                    let response = try await session.respond(to: prompt, options: options)
+                    relayTurns[turnIndex].agentMessages[messageIndex].text = response.content
+                }
+
+                // Validate we got a non-empty response
+                let result = relayTurns[turnIndex].agentMessages[messageIndex].text
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !result.isEmpty {
+                    relayTurns[turnIndex].agentMessages[messageIndex].isComplete = true
+                    return relayTurns[turnIndex].agentMessages[messageIndex].text
+                }
+
+                // Empty response — transient failure, will retry
+                lastError = nil
+                continue
+
+            } catch is CancellationError {
+                // User cancelled — stop immediately
+                relayTurns[turnIndex].agentMessages[messageIndex].isComplete = true
+                return relayTurns[turnIndex].agentMessages[messageIndex].text
+            } catch {
+                lastError = error
+                // Will retry on next iteration
+                continue
+            }
         }
 
+        // All retries exhausted or task cancelled
+        let fallback: String
+        if Task.isCancelled {
+            fallback = relayTurns[turnIndex].agentMessages[messageIndex].text
+        } else if let error = lastError {
+            fallback = "⚠️ \(agent.name) encountered an error after \(maxRetries + 1) attempts: \(error.localizedDescription)"
+        } else {
+            fallback = "⚠️ \(agent.name) returned an empty response. The on-device model may be temporarily unavailable — try again."
+        }
+        relayTurns[turnIndex].agentMessages[messageIndex].text = fallback
         relayTurns[turnIndex].agentMessages[messageIndex].isComplete = true
-        return relayTurns[turnIndex].agentMessages[messageIndex].text
+        return fallback
     }
 
     // MARK: - Tool Registry
