@@ -224,6 +224,12 @@ struct AgentBubbleView: View {
                     .fontWeight(.semibold)
                     .foregroundStyle(agentMessage.agentConfig.swiftUIColor)
 
+                if let revisedBy = agentMessage.revisedBy {
+                    Text("(revision requested by \(revisedBy))")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+
                 if isActive {
                     TypingIndicatorView()
                 }
