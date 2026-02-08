@@ -87,7 +87,8 @@ struct RequestRevisionTool: Tool {
     let agents: [AgentConfig]
     let store: RevisionRequestStore
 
-    struct Arguments: Codable {
+    @Generable
+    struct Arguments {
         @Guide(description: "The name of the agent to ask for a revision. Must match one of the available agent names exactly.")
         var targetAgentName: String
 
@@ -100,10 +101,10 @@ struct RequestRevisionTool: Tool {
         return "Request a revision from another agent in the relay. Available agents: \(names). Use this when you identify an issue that a specific other agent should fix or reconsider. The target agent will receive your revision request and produce an updated response."
     }
 
-    func call(arguments: Arguments) async throws -> ToolOutput {
+    func call(arguments: Arguments) async throws -> String {
         guard agents.contains(where: { $0.name.lowercased() == arguments.targetAgentName.lowercased() }) else {
             let names = agents.map(\.name).joined(separator: ", ")
-            return .string("Invalid agent name '\(arguments.targetAgentName)'. Available agents: \(names)")
+            return "Invalid agent name '\(arguments.targetAgentName)'. Available agents: \(names)"
         }
 
         await store.set(
@@ -111,7 +112,7 @@ struct RequestRevisionTool: Tool {
             revisionRequest: arguments.revisionRequest
         )
 
-        return .string("Revision request sent to \(arguments.targetAgentName). They will review: \(arguments.revisionRequest)")
+        return "Revision request sent to \(arguments.targetAgentName). They will review: \(arguments.revisionRequest)"
     }
 }
 
