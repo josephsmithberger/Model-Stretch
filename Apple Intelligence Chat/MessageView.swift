@@ -321,21 +321,46 @@ struct CodeBlockView: View {
     let code: String
     let language: String?
     
+    @State private var isCopied = false
+    
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            if let language = language, !language.isEmpty {
-                Text(language)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 12)
-                    .padding(.top, 8)
+            // Header with language label and copy button
+            HStack {
+                if let language = language, !language.isEmpty {
+                    Text(language)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                
+                Spacer()
+                
+                Button {
+                    copyToClipboard()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: isCopied ? "checkmark" : "doc.on.doc")
+                            .font(.caption)
+                        Text(isCopied ? "Copied" : "Copy")
+                            .font(.caption)
+                    }
+                    .foregroundStyle(isCopied ? .green : .secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color.primary.opacity(0.05))
+                    .clipShape(.rect(cornerRadius: 6))
+                }
+                .buttonStyle(.plain)
             }
+            .padding(.horizontal, 12)
+            .padding(.top, 8)
             
             ScrollView(.horizontal, showsIndicators: false) {
                 Text(code)
                     .font(.system(.body, design: .monospaced))
                     .textSelection(.enabled)
-                    .padding(language != nil ? [.horizontal, .bottom] : .all, 12)
+                    .padding(.horizontal, 12)
+                    .padding(.bottom, 12)
             }
         }
         .background(Color.primary.opacity(0.05))
@@ -344,6 +369,22 @@ struct CodeBlockView: View {
             RoundedRectangle(cornerRadius: 8)
                 .stroke(Color.primary.opacity(0.1), lineWidth: 1)
         )
+    }
+    
+    private func copyToClipboard() {
+#if os(macOS)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(code, forType: .string)
+#else
+        UIPasteboard.general.string = code
+#endif
+        
+        isCopied = true
+        
+        // Reset the "Copied" state after 2 seconds
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+            isCopied = false
+        }
     }
 }
 
