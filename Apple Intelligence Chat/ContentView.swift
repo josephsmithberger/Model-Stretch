@@ -19,6 +19,10 @@ struct ContentView: View {
     @State private var showSettings = false
     @State private var showErrorAlert = false
     @State private var errorMessage = ""
+#if DEBUG
+    @State private var showDebugPanel = false
+#endif
+    @State private var conversationId = UUID()
     
     // Model State
     @State private var session: LanguageModelSession?
@@ -59,6 +63,11 @@ struct ContentView: View {
                     session = nil // Reset session on settings change
                 }
             }
+#if DEBUG
+            .sheet(isPresented: $showDebugPanel) {
+                DebugPanelView()
+            }
+#endif
             .alert("Error", isPresented: $showErrorAlert) {
                 Button("OK") {}
             } message: {
@@ -141,6 +150,15 @@ struct ContentView: View {
     
     @ToolbarContentBuilder
     private var toolbarContent: some ToolbarContent {
+#if DEBUG
+        ToolbarItem(placement: .principal) {
+            Text(agentModeEnabled ? "Agent Relay ⚡" : "Apple Intelligence Chat")
+                .onTapGesture(count: 5) {
+                    showDebugPanel = true
+                }
+                .accessibilityHint("Tap five times to open debug panel")
+        }
+#endif
 #if os(iOS)
         ToolbarItem(placement: .navigationBarLeading) {
             Button(action: resetConversation) {
@@ -186,6 +204,20 @@ struct ContentView: View {
         messages.append(userMessage)
         let prompt = inputText
         inputText = ""
+#if DEBUG
+        DebugLog.shared.record(
+            kind: .conversation,
+            conversationId: conversationId,
+            actor: "User",
+            content: userMessage.text
+        )
+        DebugLog.shared.record(
+            kind: .handoff,
+            conversationId: conversationId,
+            actor: "System",
+            content: "User -> Assistant"
+        )
+#endif
         
         // Add empty assistant message for streaming
         messages.append(ChatMessage(role: .assistant, text: ""))
@@ -219,6 +251,30 @@ struct ContentView: View {
             } catch {
                 showError(message: "An error occurred: \(error.localizedDescription)")
             }
+
+#if DEBUG
+            await MainActor.run {
+                if let assistantText = messages.last?.text,
+                   !assistantText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    DebugLog.shared.record(
+                        kind: .conversation,
+                        conversationId: conversationId,
+                        actor: "Assistant",
+                        content: assistantText
+                    )
+
+                    let misses = ToolCallDetector.extractMissedToolCalls(from: assistantText)
+                    for miss in misses {
+                        DebugLog.shared.record(
+                            kind: .toolCallMiss,
+                            conversationId: conversationId,
+                            actor: "Assistant",
+                            content: miss
+                        )
+                    }
+                }
+            }
+#endif
             
             isResponding = false
             streamingTask = nil
@@ -246,6 +302,7 @@ struct ContentView: View {
         session = nil
         // Reset agent relay by changing its identity
         agentViewID = UUID()
+        conversationId = UUID()
     }
     
     private func availabilityDescription(for availability: SystemLanguageModel.Availability) -> String {

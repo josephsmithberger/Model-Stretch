@@ -56,17 +56,33 @@ struct RelayTurn: Identifiable, Equatable {
 /// Shared between `RequestRevisionTool` instances and the `AgentManager` so
 /// the manager can check whether a revision was requested after each agent
 /// finishes generating.
+///
+/// Includes duplicate detection to prevent the same agent from calling the
+/// revision tool multiple times during a single generation.
 actor RevisionRequestStore {
     private var pending: (targetAgentName: String, revisionRequest: String)?
+    /// Tracks whether a revision has already been requested in the current generation
+    private var revisionAlreadyRequestedThisGeneration = false
 
-    func set(targetAgentName: String, revisionRequest: String) {
+    func set(targetAgentName: String, revisionRequest: String) -> Bool {
+        // Prevent duplicate revision requests during the same agent's generation
+        if revisionAlreadyRequestedThisGeneration {
+            return false  // Indicates the request was rejected
+        }
         pending = (targetAgentName, revisionRequest)
+        revisionAlreadyRequestedThisGeneration = true
+        return true  // Indicates success
     }
 
     func consume() -> (targetAgentName: String, revisionRequest: String)? {
         let value = pending
         pending = nil
         return value
+    }
+
+    /// Call this at the start of each agent's generation to reset the flag
+    func resetForNewGeneration() {
+        revisionAlreadyRequestedThisGeneration = false
     }
 }
 
@@ -86,10 +102,13 @@ actor RevisionRequestStore {
 struct RequestRevisionTool: Tool {
     let agents: [AgentConfig]
     let store: RevisionRequestStore
+    let conversationId: UUID
+    /// The name of the agent currently generating — used to prevent self-revision.
+    let callingAgentName: String
 
     @Generable
     struct Arguments {
-        @Guide(description: "The name of the agent to ask for a revision. Must match one of the available agent names exactly.")
+        @Guide(description: "The name of the agent to ask for a revision. Must be a DIFFERENT agent from yourself. Must match one of the available agent names exactly.")
         var targetAgentName: String
 
         @Guide(description: "A clear, specific description of what needs to be revised or reconsidered.")
@@ -97,22 +116,89 @@ struct RequestRevisionTool: Tool {
     }
 
     var description: String {
-        let names = agents.map(\.name).joined(separator: ", ")
-        return "Request a revision from another agent in the relay. Available agents: \(names). Use this when you identify an issue that a specific other agent should fix or reconsider. The target agent will receive your revision request and produce an updated response."
+        let otherNames = agents
+            .filter { $0.name.lowercased() != callingAgentName.lowercased() }
+            .map(\.name)
+            .joined(separator: ", ")
+        return """
+            Request a revision from a DIFFERENT agent in the relay. You are \(callingAgentName).
+            
+            IMPORTANT: Call this tool ONLY ONCE per response. Do not call it multiple times.
+            
+            Available targets: \(otherNames)
+            
+            Use this ONLY when you identify a specific issue that another agent should fix.
+            After calling this tool, explain your reasoning in your response text.
+            """
     }
 
     func call(arguments: Arguments) async throws -> String {
-        guard agents.contains(where: { $0.name.lowercased() == arguments.targetAgentName.lowercased() }) else {
-            let names = agents.map(\.name).joined(separator: ", ")
-            return "Invalid agent name '\(arguments.targetAgentName)'. Available agents: \(names)"
+#if DEBUG
+        DebugLog.shared.record(
+            kind: .toolCall,
+            conversationId: conversationId,
+            actor: "RequestRevisionTool",
+            content: "targetAgentName=\(arguments.targetAgentName), revisionRequest=\(arguments.revisionRequest)"
+        )
+#endif
+
+        // Reject self-revision
+        guard arguments.targetAgentName.lowercased() != callingAgentName.lowercased() else {
+            let errorMsg = "ERROR: You cannot request a revision from yourself. Choose a different agent, or skip the revision request entirely."
+#if DEBUG
+            DebugLog.shared.record(
+                kind: .toolCall,
+                conversationId: conversationId,
+                actor: "RequestRevisionTool",
+                content: "REJECTED: Self-revision attempted by \(callingAgentName)"
+            )
+#endif
+            return errorMsg
         }
 
-        await store.set(
+        guard agents.contains(where: { $0.name.lowercased() == arguments.targetAgentName.lowercased() }) else {
+            let names = agents.map(\.name).joined(separator: ", ")
+            let errorMsg = "ERROR: Invalid agent name '\(arguments.targetAgentName)'. Available agents: \(names)"
+#if DEBUG
+            DebugLog.shared.record(
+                kind: .toolCall,
+                conversationId: conversationId,
+                actor: "RequestRevisionTool",
+                content: "REJECTED: Invalid target '\(arguments.targetAgentName)'"
+            )
+#endif
+            return errorMsg
+        }
+
+        // Attempt to set the revision request — this will fail if already called
+        let success = await store.set(
             targetAgentName: arguments.targetAgentName,
             revisionRequest: arguments.revisionRequest
         )
 
-        return "Revision request sent to \(arguments.targetAgentName). They will review: \(arguments.revisionRequest)"
+        if !success {
+            let errorMsg = "ERROR: You have already requested a revision in this response. Do not call this tool again. Continue with your response."
+#if DEBUG
+            DebugLog.shared.record(
+                kind: .toolCall,
+                conversationId: conversationId,
+                actor: "RequestRevisionTool",
+                content: "REJECTED: Duplicate call by \(callingAgentName)"
+            )
+#endif
+            return errorMsg
+        }
+
+#if DEBUG
+        DebugLog.shared.record(
+            kind: .toolCall,
+            conversationId: conversationId,
+            actor: "RequestRevisionTool",
+            content: "ACCEPTED: \(callingAgentName) -> \(arguments.targetAgentName)"
+        )
+#endif
+
+        return "Revision request successfully sent to \(arguments.targetAgentName). They will review: \(arguments.revisionRequest). Now continue with your own response explaining what you found."
     }
 }
 
@@ -147,6 +233,7 @@ class AgentManager {
     var relayTurns: [RelayTurn] = []
     var isRunning = false
     var currentAgentIndex: Int?
+    var conversationId = UUID()
 
     // MARK: - Private
 
@@ -195,12 +282,25 @@ class AgentManager {
 
         let turn = RelayTurn(
             userMessage: userMessage,
-            agentMessages: agents.map {
-                AgentMessage(agentConfig: $0, text: "", isComplete: false, revisedBy: nil)
-            }
+            agentMessages: []  // Messages are added on-demand as each agent starts
         )
         relayTurns.append(turn)
         let turnIndex = relayTurns.count - 1
+
+#if DEBUG
+        DebugLog.shared.record(
+            kind: .conversation,
+            conversationId: conversationId,
+            actor: "User",
+            content: userMessage
+        )
+        DebugLog.shared.record(
+            kind: .narration,
+            conversationId: conversationId,
+            actor: "System",
+            content: "Relay started"
+        )
+#endif
 
         currentTask = Task {
             var previousOutput = userMessage
@@ -217,7 +317,22 @@ class AgentManager {
                     try? await Task.sleep(for: .milliseconds(500))
                 }
 
-                currentAgentIndex = agentIdx
+                // Create the message slot for this agent on-demand
+                let agentMsg = AgentMessage(
+                    agentConfig: agent, text: "", isComplete: false, revisedBy: nil
+                )
+                relayTurns[turnIndex].agentMessages.append(agentMsg)
+                let messageIndex = relayTurns[turnIndex].agentMessages.count - 1
+                currentAgentIndex = messageIndex
+
+#if DEBUG
+                DebugLog.shared.record(
+                    kind: .handoff,
+                    conversationId: conversationId,
+                    actor: "System",
+                    content: "\(previousAgentName) -> \(agent.name)"
+                )
+#endif
 
                 // ── Run the agent with a fresh session ──
                 let output = await runAgent(
@@ -228,18 +343,49 @@ class AgentManager {
                     temperature: temperature,
                     useStreaming: useStreaming,
                     turnIndex: turnIndex,
-                    messageIndex: agentIdx
+                    messageIndex: messageIndex
                 )
 
                 agentOutputs[agent.name] = output
 
+#if DEBUG
+                DebugLog.shared.record(
+                    kind: .conversation,
+                    conversationId: conversationId,
+                    actor: agent.name,
+                    content: output
+                )
+                let misses = ToolCallDetector.extractMissedToolCalls(from: output)
+                for miss in misses {
+                    DebugLog.shared.record(
+                        kind: .toolCallMiss,
+                        conversationId: conversationId,
+                        actor: agent.name,
+                        content: miss
+                    )
+                }
+#endif
+
                 // ── Check for revision requests from tool calling ──
-                if let revision = await revisionStore.consume(),
+                // Skip revision processing if the agent errored out
+                if !output.hasPrefix("⚠️"),
+                   let revision = await revisionStore.consume(),
                    revisionCount < maxRevisionLoops,
                    let targetConfig = agents.first(where: {
                        $0.name.lowercased() == revision.targetAgentName.lowercased()
-                   }) {
+                   }),
+                   // Extra safety: don't allow revision targeting the same agent
+                   targetConfig.name.lowercased() != agent.name.lowercased() {
                     revisionCount += 1
+
+#if DEBUG
+                    DebugLog.shared.record(
+                        kind: .narration,
+                        conversationId: conversationId,
+                        actor: "System",
+                        content: "Revision requested by \(agent.name) -> \(targetConfig.name)"
+                    )
+#endif
 
                     // Add a revision bubble to the UI
                     let revMsg = AgentMessage(
@@ -278,10 +424,33 @@ class AgentManager {
 
                     agentOutputs[targetConfig.name] = revOutput
 
+#if DEBUG
+                    DebugLog.shared.record(
+                        kind: .conversation,
+                        conversationId: conversationId,
+                        actor: targetConfig.name,
+                        content: revOutput
+                    )
+                    let revMisses = ToolCallDetector.extractMissedToolCalls(from: revOutput)
+                    for miss in revMisses {
+                        DebugLog.shared.record(
+                            kind: .toolCallMiss,
+                            conversationId: conversationId,
+                            actor: targetConfig.name,
+                            content: miss
+                        )
+                    }
+#endif
+
                     // Next sequential agent picks up from the revision
                     previousOutput = revOutput
                     previousAgentName = targetConfig.name
                 } else {
+                    // Consume and discard any stale revision request (e.g. from
+                    // an errored agent, self-revision that slipped through, or
+                    // exceeding the revision cap)
+                    _ = await revisionStore.consume()
+
                     // Normal handoff — only update context if the agent
                     // produced a real response (not an error fallback)
                     if !output.hasPrefix("⚠️") {
@@ -311,6 +480,7 @@ class AgentManager {
     func reset() {
         stopRelay()
         relayTurns.removeAll()
+        conversationId = UUID()
     }
 
     // MARK: - Single Agent Run
@@ -347,8 +517,15 @@ class AgentManager {
                 try? await Task.sleep(for: .seconds(1))
             }
 
+            // Reset revision flag at the start of each generation attempt
+            await revisionStore.resetForNewGeneration()
+
+            // Clear any stale revision requests from failed previous attempts
+            _ = await revisionStore.consume()
+
             // Fresh session every attempt — never reuse
-            let tools = buildTools()
+            // Each agent gets its own tool instances that know the caller's identity
+            let tools = buildTools(forAgent: agent.name)
             let session = LanguageModelSession(
                 tools: tools,
                 instructions: agent.systemPrompt
@@ -356,6 +533,7 @@ class AgentManager {
             let options = GenerationOptions(temperature: temperature)
 
             let prompt = buildFocusedPrompt(
+                agentName: agent.name,
                 previousAgentName: previousAgentName,
                 previousOutput: previousOutput,
                 userMessage: userMessage
@@ -373,17 +551,33 @@ class AgentManager {
                     relayTurns[turnIndex].agentMessages[messageIndex].text = response.content
                 }
 
-                // Validate we got a non-empty response
+                // Validate we got a non-empty, non-null response
                 let result = relayTurns[turnIndex].agentMessages[messageIndex].text
                     .trimmingCharacters(in: .whitespacesAndNewlines)
-                if !result.isEmpty {
-                    relayTurns[turnIndex].agentMessages[messageIndex].isComplete = true
-                    return relayTurns[turnIndex].agentMessages[messageIndex].text
+                
+                // Check for common failure patterns
+                if result.isEmpty {
+                    // Empty response — transient failure, will retry
+                    lastError = nil
+                    continue
+                } else if result.lowercased() == "null" || result.lowercased() == "nil" {
+                    // Model returned literal "null" — treat as error
+#if DEBUG
+                    DebugLog.shared.record(
+                        kind: .conversation,
+                        conversationId: conversationId,
+                        actor: "System",
+                        content: "⚠️ \(agent.name) returned literal 'null' on attempt \(attempt + 1)"
+                    )
+#endif
+                    lastError = nil
+                    continue
                 }
+                
+                // Valid response received
+                relayTurns[turnIndex].agentMessages[messageIndex].isComplete = true
 
-                // Empty response — transient failure, will retry
-                lastError = nil
-                continue
+                return relayTurns[turnIndex].agentMessages[messageIndex].text
 
             } catch is CancellationError {
                 // User cancelled — stop immediately
@@ -391,6 +585,14 @@ class AgentManager {
                 return relayTurns[turnIndex].agentMessages[messageIndex].text
             } catch {
                 lastError = error
+#if DEBUG
+                DebugLog.shared.record(
+                    kind: .narration,
+                    conversationId: conversationId,
+                    actor: "System",
+                    content: "⚠️ \(agent.name) error on attempt \(attempt + 1): \(error.localizedDescription)"
+                )
+#endif
                 // Will retry on next iteration
                 continue
             }
@@ -403,7 +605,7 @@ class AgentManager {
         } else if let error = lastError {
             fallback = "⚠️ \(agent.name) encountered an error after \(maxRetries + 1) attempts: \(error.localizedDescription)"
         } else {
-            fallback = "⚠️ \(agent.name) returned an empty response. The on-device model may be temporarily unavailable — try again."
+            fallback = "⚠️ \(agent.name) failed to produce a valid response after \(maxRetries + 1) attempts. The on-device model may be temporarily unavailable — try again in a moment."
         }
         relayTurns[turnIndex].agentMessages[messageIndex].text = fallback
         relayTurns[turnIndex].agentMessages[messageIndex].isComplete = true
@@ -423,11 +625,17 @@ class AgentManager {
     /// The Foundation Models framework automatically describes your tools to
     /// the model, invokes them when the model requests, and feeds the result
     /// back into generation.
-    private func buildTools() -> [any Tool] {
+    private func buildTools(forAgent agentName: String) -> [any Tool] {
         var tools: [any Tool] = []
 
         // Revision tool — lets agents request help from each other
-        tools.append(RequestRevisionTool(agents: agents, store: revisionStore))
+        // Passes `callingAgentName` so the tool can reject self-revisions.
+        tools.append(RequestRevisionTool(
+            agents: agents,
+            store: revisionStore,
+            conversationId: conversationId,
+            callingAgentName: agentName
+        ))
 
         // ── Add future tools below ──────────────────────────────
         // tools.append(WebSearchTool())
@@ -447,17 +655,22 @@ class AgentManager {
     ///
     /// This prevents context rot by never dumping the full conversation.
     private func buildFocusedPrompt(
+        agentName: String,
         previousAgentName: String,
         previousOutput: String,
         userMessage: String
     ) -> String {
         if previousAgentName == "User" {
             return """
+                [You are: \(agentName)]
+
                 [User Request]:
                 \(userMessage)
                 """
         } else {
             return """
+                [You are: \(agentName)]
+
                 [User Request]:
                 \(userMessage)
 
