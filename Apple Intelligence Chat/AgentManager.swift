@@ -60,21 +60,21 @@ struct RelayTurn: Identifiable, Equatable {
 /// Includes duplicate detection to prevent the same agent from calling the
 /// revision tool multiple times during a single generation.
 actor RevisionRequestStore {
-    private var pending: (targetAgentName: String, revisionRequest: String)?
+    private var pending: (requesterName: String, targetAgentName: String, revisionRequest: String)?
     /// Tracks whether a revision has already been requested in the current generation
     private var revisionAlreadyRequestedThisGeneration = false
 
-    func set(targetAgentName: String, revisionRequest: String) -> Bool {
+    func set(requesterName: String, targetAgentName: String, revisionRequest: String) -> Bool {
         // Prevent duplicate revision requests during the same agent's generation
         if revisionAlreadyRequestedThisGeneration {
             return false  // Indicates the request was rejected
         }
-        pending = (targetAgentName, revisionRequest)
+        pending = (requesterName, targetAgentName, revisionRequest)
         revisionAlreadyRequestedThisGeneration = true
         return true  // Indicates success
     }
 
-    func consume() -> (targetAgentName: String, revisionRequest: String)? {
+    func consume() -> (requesterName: String, targetAgentName: String, revisionRequest: String)? {
         let value = pending
         pending = nil
         return value
@@ -105,6 +105,8 @@ struct RequestRevisionTool: Tool {
     let conversationId: UUID
     /// The name of the agent currently generating — used to prevent self-revision.
     let callingAgentName: String
+    /// Names of agents that have already produced output in this relay turn.
+    let eligibleTargetNames: [String]
 
     @Generable
     struct Arguments {
@@ -116,16 +118,15 @@ struct RequestRevisionTool: Tool {
     }
 
     var description: String {
-        let otherNames = agents
-            .filter { $0.name.lowercased() != callingAgentName.lowercased() }
-            .map(\.name)
-            .joined(separator: ", ")
+        let eligible = eligibleTargetNames
+            .filter { $0.lowercased() != callingAgentName.lowercased() }
+        let otherNames = eligible.isEmpty ? "(none yet)" : eligible.joined(separator: ", ")
         return """
             Request a revision from a DIFFERENT agent in the relay. You are \(callingAgentName).
             
             IMPORTANT: Call this tool ONLY ONCE per response. Do not call it multiple times.
             
-            Available targets: \(otherNames)
+            Available targets (only agents who have already responded): \(otherNames)
             
             Use this ONLY when you identify a specific issue that another agent should fix.
             After calling this tool, explain your reasoning in your response text.
@@ -170,8 +171,23 @@ struct RequestRevisionTool: Tool {
             return errorMsg
         }
 
+        let eligibleLowercased = Set(eligibleTargetNames.map { $0.lowercased() })
+        guard eligibleLowercased.contains(arguments.targetAgentName.lowercased()) else {
+            let errorMsg = "ERROR: You can only request revisions from agents who have already responded in this relay."
+#if DEBUG
+            DebugLog.shared.record(
+                kind: .toolCall,
+                conversationId: conversationId,
+                actor: "RequestRevisionTool",
+                content: "REJECTED: Target not yet eligible '\(arguments.targetAgentName)'"
+            )
+#endif
+            return errorMsg
+        }
+
         // Attempt to set the revision request — this will fail if already called
         let success = await store.set(
+            requesterName: callingAgentName,
             targetAgentName: arguments.targetAgentName,
             revisionRequest: arguments.revisionRequest
         )
@@ -340,6 +356,7 @@ class AgentManager {
                     userMessage: userMessage,
                     previousAgentName: previousAgentName,
                     previousOutput: previousOutput,
+                    eligibleRevisionTargets: Array(agentOutputs.keys),
                     temperature: temperature,
                     useStreaming: useStreaming,
                     turnIndex: turnIndex,
@@ -368,14 +385,15 @@ class AgentManager {
 
                 // ── Check for revision requests from tool calling ──
                 // Skip revision processing if the agent errored out
-                if !output.hasPrefix("⚠️"),
-                   let revision = await revisionStore.consume(),
+                     if !output.hasPrefix("⚠️"),
+                         let revision = await revisionStore.consume(),
                    revisionCount < maxRevisionLoops,
                    let targetConfig = agents.first(where: {
                        $0.name.lowercased() == revision.targetAgentName.lowercased()
-                   }),
+                         }),
+                         agentOutputs.keys.contains(where: { $0.lowercased() == targetConfig.name.lowercased() }),
                    // Extra safety: don't allow revision targeting the same agent
-                   targetConfig.name.lowercased() != agent.name.lowercased() {
+                         targetConfig.name.lowercased() != agent.name.lowercased() {
                     revisionCount += 1
 
 #if DEBUG
@@ -383,7 +401,7 @@ class AgentManager {
                         kind: .narration,
                         conversationId: conversationId,
                         actor: "System",
-                        content: "Revision requested by \(agent.name) -> \(targetConfig.name)"
+                        content: "Revision requested by \(revision.requesterName) -> \(targetConfig.name)"
                     )
 #endif
 
@@ -392,7 +410,7 @@ class AgentManager {
                         agentConfig: targetConfig,
                         text: "",
                         isComplete: false,
-                        revisedBy: agent.name
+                        revisedBy: revision.requesterName
                     )
                     relayTurns[turnIndex].agentMessages.append(revMsg)
                     let revMsgIdx = relayTurns[turnIndex].agentMessages.count - 1
@@ -400,7 +418,7 @@ class AgentManager {
 
                     // Build revision-specific context
                     let revisionContext = """
-                        \(agent.name) requested a revision from you.
+                        \(revision.requesterName) requested a revision from you.
 
                         Revision request: \(revision.revisionRequest)
 
@@ -416,6 +434,7 @@ class AgentManager {
                         userMessage: userMessage,
                         previousAgentName: agent.name,
                         previousOutput: revisionContext,
+                        eligibleRevisionTargets: Array(agentOutputs.keys),
                         temperature: temperature,
                         useStreaming: useStreaming,
                         turnIndex: turnIndex,
@@ -500,6 +519,7 @@ class AgentManager {
         userMessage: String,
         previousAgentName: String,
         previousOutput: String,
+        eligibleRevisionTargets: [String],
         temperature: Double,
         useStreaming: Bool,
         turnIndex: Int,
@@ -525,7 +545,7 @@ class AgentManager {
 
             // Fresh session every attempt — never reuse
             // Each agent gets its own tool instances that know the caller's identity
-            let tools = buildTools(forAgent: agent.name)
+            let tools = buildTools(forAgent: agent.name, eligibleRevisionTargets: eligibleRevisionTargets)
             let session = LanguageModelSession(
                 tools: tools,
                 instructions: agent.systemPrompt
@@ -625,7 +645,7 @@ class AgentManager {
     /// The Foundation Models framework automatically describes your tools to
     /// the model, invokes them when the model requests, and feeds the result
     /// back into generation.
-    private func buildTools(forAgent agentName: String) -> [any Tool] {
+    private func buildTools(forAgent agentName: String, eligibleRevisionTargets: [String]) -> [any Tool] {
         var tools: [any Tool] = []
 
         // Revision tool — lets agents request help from each other
@@ -634,7 +654,8 @@ class AgentManager {
             agents: agents,
             store: revisionStore,
             conversationId: conversationId,
-            callingAgentName: agentName
+            callingAgentName: agentName,
+            eligibleTargetNames: eligibleRevisionTargets
         ))
 
         // ── Add future tools below ──────────────────────────────

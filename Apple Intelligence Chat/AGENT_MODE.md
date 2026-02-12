@@ -12,12 +12,12 @@ Agent Relay Mode stretches tiny on-device LLMs beyond their vanilla capabilities
 User Message
     │
     ▼
-┌─────────┐     ┌─────────┐     ┌─────────┐
-│  Aria    │ ──▶ │  Cody   │ ──▶ │  Rexa   │
-│ Architect│     │  Coder  │     │ Reviewer │
-│  🏗️     │     │  💻     │     │  🔍     │
-└─────────┘     └─────────┘     └─────────┘
-    Plan     ──▶   Implement  ──▶   Review
+┌─────────┐     ┌─────────┐     ┌─────────┐     ┌─────────┐
+│ Andrea  │ ──▶ │  Barb   │ ──▶ │ Carmen  │ ──▶ │ Reinie  │
+│ Architect│     │ Builder │     │  Coder  │     │ Reviewer │
+│  📋     │     │  🧱     │     │  💻     │     │  🔍     │
+└─────────┘     └─────────┘     └─────────┘     └─────────┘
+    Plan     ──▶ Framework  ──▶   Fill In   ──▶   Review
                                      │
                               🔧 tool call:
                           "request_revision"
@@ -104,8 +104,11 @@ The original user message
 Only the immediately previous agent's output
 ```
 
-- The **first agent** gets just the user request
-- **Subsequent agents** get the user request + what the agent right before them said
+- The **first agent** gets just the user request (Andrea plans)
+- **Barb** turns the plan into a code framework (skeletons only)
+- **Carmen** fills in the framework with working code
+- **Reinie** reviews the code
+- **Subsequent agents** always get the user request + what the agent right before them said
 - **Revision agents** get a focused revision context: what was asked, their original output, and the requester's output
 - **No full conversation dumps.** Each session is fresh. No context bleeds between agents.
 
