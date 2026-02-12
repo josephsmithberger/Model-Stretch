@@ -7,6 +7,7 @@
 
 import SwiftUI
 import FoundationModels
+// Ensure Tool, ToolOutput are available
 
 // MARK: - Agent Configuration Model
 
@@ -18,6 +19,7 @@ struct AgentConfig: Codable, Identifiable, Equatable {
     let color: String
     let systemPrompt: String
     let order: Int
+    let canRequestRevisions: Bool
 
     /// Parses the hex color string into a SwiftUI `Color`
     var swiftUIColor: Color {
@@ -100,6 +102,9 @@ actor RevisionRequestStore {
 /// Cody the Coder to fix it. The relay loops back to Cody with the
 /// specific revision request.
 struct RequestRevisionTool: Tool {
+    static var name: String { "RequestRevision" }
+    var name: String { Self.name }
+
     let agents: [AgentConfig]
     let store: RevisionRequestStore
     let conversationId: UUID
@@ -110,11 +115,8 @@ struct RequestRevisionTool: Tool {
 
     @Generable
     struct Arguments {
-        @Guide(description: "The name of the agent to ask for a revision. Must be a DIFFERENT agent from yourself. Must match one of the available agent names exactly.")
-        var targetAgentName: String
-
-        @Guide(description: "A clear, specific description of what needs to be revised or reconsidered.")
-        var revisionRequest: String
+        @Guide(description: "Format: <target agent name> | <revision request>. Example: Carmen | Handle null input in updatePhysics.")
+        var request: String
     }
 
     var description: String {
@@ -139,12 +141,20 @@ struct RequestRevisionTool: Tool {
             kind: .toolCall,
             conversationId: conversationId,
             actor: "RequestRevisionTool",
-            content: "targetAgentName=\(arguments.targetAgentName), revisionRequest=\(arguments.revisionRequest)"
+            content: "request=\(arguments.request)"
         )
 #endif
 
+        let parts = arguments.request.split(separator: "|", maxSplits: 1).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard parts.count == 2, !parts[0].isEmpty, !parts[1].isEmpty else {
+            return "ERROR: Invalid request format. Use: <target agent name> | <revision request>."
+        }
+
+        let targetAgentName = parts[0]
+        let revisionRequest = parts[1]
+
         // Reject self-revision
-        guard arguments.targetAgentName.lowercased() != callingAgentName.lowercased() else {
+        guard targetAgentName.lowercased() != callingAgentName.lowercased() else {
             let errorMsg = "ERROR: You cannot request a revision from yourself. Choose a different agent, or skip the revision request entirely."
 #if DEBUG
             DebugLog.shared.record(
@@ -157,29 +167,29 @@ struct RequestRevisionTool: Tool {
             return errorMsg
         }
 
-        guard agents.contains(where: { $0.name.lowercased() == arguments.targetAgentName.lowercased() }) else {
+        guard agents.contains(where: { $0.name.lowercased() == targetAgentName.lowercased() }) else {
             let names = agents.map(\.name).joined(separator: ", ")
-            let errorMsg = "ERROR: Invalid agent name '\(arguments.targetAgentName)'. Available agents: \(names)"
+            let errorMsg = "ERROR: Invalid agent name '\(targetAgentName)'. Available agents: \(names)"
 #if DEBUG
             DebugLog.shared.record(
                 kind: .toolCall,
                 conversationId: conversationId,
                 actor: "RequestRevisionTool",
-                content: "REJECTED: Invalid target '\(arguments.targetAgentName)'"
+                content: "REJECTED: Invalid target '\(targetAgentName)'"
             )
 #endif
             return errorMsg
         }
 
         let eligibleLowercased = Set(eligibleTargetNames.map { $0.lowercased() })
-        guard eligibleLowercased.contains(arguments.targetAgentName.lowercased()) else {
+        guard eligibleLowercased.contains(targetAgentName.lowercased()) else {
             let errorMsg = "ERROR: You can only request revisions from agents who have already responded in this relay."
 #if DEBUG
             DebugLog.shared.record(
                 kind: .toolCall,
                 conversationId: conversationId,
                 actor: "RequestRevisionTool",
-                content: "REJECTED: Target not yet eligible '\(arguments.targetAgentName)'"
+                content: "REJECTED: Target not yet eligible '\(targetAgentName)'"
             )
 #endif
             return errorMsg
@@ -188,8 +198,8 @@ struct RequestRevisionTool: Tool {
         // Attempt to set the revision request — this will fail if already called
         let success = await store.set(
             requesterName: callingAgentName,
-            targetAgentName: arguments.targetAgentName,
-            revisionRequest: arguments.revisionRequest
+            targetAgentName: targetAgentName,
+            revisionRequest: revisionRequest
         )
 
         if !success {
@@ -210,11 +220,11 @@ struct RequestRevisionTool: Tool {
             kind: .toolCall,
             conversationId: conversationId,
             actor: "RequestRevisionTool",
-            content: "ACCEPTED: \(callingAgentName) -> \(arguments.targetAgentName)"
+            content: "ACCEPTED: \(callingAgentName) -> \(targetAgentName)"
         )
 #endif
 
-        return "Revision request successfully sent to \(arguments.targetAgentName). They will review: \(arguments.revisionRequest). Now continue with your own response explaining what you found."
+        return "Revision request successfully sent to \(targetAgentName). They will review: \(revisionRequest). Now continue with your own response explaining what you found."
     }
 }
 
@@ -527,6 +537,7 @@ class AgentManager {
         maxRetries: Int = 2
     ) async -> String {
         var lastError: Error?
+        var disableToolsForRetry = false
 
         for attempt in 0...maxRetries {
             guard !Task.isCancelled else { break }
@@ -545,7 +556,9 @@ class AgentManager {
 
             // Fresh session every attempt — never reuse
             // Each agent gets its own tool instances that know the caller's identity
-            let tools = buildTools(forAgent: agent.name, eligibleRevisionTargets: eligibleRevisionTargets)
+            let tools = disableToolsForRetry
+                ? []
+                : buildTools(forAgent: agent, eligibleRevisionTargets: eligibleRevisionTargets)
             let session = LanguageModelSession(
                 tools: tools,
                 instructions: agent.systemPrompt
@@ -606,6 +619,19 @@ class AgentManager {
             } catch {
                 lastError = error
 #if DEBUG
+                if error.localizedDescription.contains("Failed to deserialize a Generable type") {
+                    DebugLog.shared.record(
+                        kind: .narration,
+                        conversationId: conversationId,
+                        actor: "System",
+                        content: "⚠️ Disabling tools for \(agent.name) retry due to tool argument parse failure"
+                    )
+                }
+#endif
+                if error.localizedDescription.contains("Failed to deserialize a Generable type") {
+                    disableToolsForRetry = true
+                }
+#if DEBUG
                 DebugLog.shared.record(
                     kind: .narration,
                     conversationId: conversationId,
@@ -645,8 +671,12 @@ class AgentManager {
     /// The Foundation Models framework automatically describes your tools to
     /// the model, invokes them when the model requests, and feeds the result
     /// back into generation.
-    private func buildTools(forAgent agentName: String, eligibleRevisionTargets: [String]) -> [any Tool] {
+    private func buildTools(forAgent agent: AgentConfig, eligibleRevisionTargets: [String]) -> [any Tool] {
         var tools: [any Tool] = []
+
+        guard agent.canRequestRevisions, !eligibleRevisionTargets.isEmpty else {
+            return tools
+        }
 
         // Revision tool — lets agents request help from each other
         // Passes `callingAgentName` so the tool can reject self-revisions.
@@ -654,7 +684,7 @@ class AgentManager {
             agents: agents,
             store: revisionStore,
             conversationId: conversationId,
-            callingAgentName: agentName,
+            callingAgentName: agent.name,
             eligibleTargetNames: eligibleRevisionTargets
         ))
 
